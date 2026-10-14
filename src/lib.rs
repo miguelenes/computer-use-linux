@@ -10,12 +10,14 @@ mod diagnostics_impl;
 mod gnome_extension;
 mod identity;
 pub mod indicator;
+mod jev;
 mod keyboard_keymap;
 mod remote_desktop;
 #[path = "screenshot.rs"]
 mod screenshot_impl;
 mod server;
 mod terminal;
+mod vm;
 mod windowing;
 mod windows;
 mod x11_display;

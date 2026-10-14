@@ -20,6 +20,7 @@
 use std::{
     env,
     fs::{File, OpenOptions, TryLockError},
+    future::Future,
     io::{self, ErrorKind},
     os::linux::net::SocketAddrExt,
     os::unix::net::{SocketAddr, UnixDatagram},
@@ -48,6 +49,21 @@ const DISABLE_ENV: &str = "COMPUTER_USE_LINUX_INDICATOR";
 const HIDE_TEXT_ENV: &str = "COMPUTER_USE_LINUX_INDICATOR_HIDE_TEXT";
 const AGENT_ENV: &str = "COMPUTER_USE_LINUX_AGENT_NAME";
 const BINARY_ENV: &str = "COMPUTER_USE_LINUX_INDICATOR_BIN";
+
+tokio::task_local! {
+    static SUPPRESS_ACTIVITY_INDICATOR: ();
+}
+
+/// Runs a task without publishing its action events to the visible overlay.
+/// The suppression is task-local, so concurrent atomic MCP calls keep their
+/// configured indicator behavior.
+pub(crate) async fn without_activity_indicator<F: Future>(future: F) -> F::Output {
+    SUPPRESS_ACTIVITY_INDICATOR.scope((), future).await
+}
+
+fn activity_indicator_suppressed() -> bool {
+    SUPPRESS_ACTIVITY_INDICATOR.try_with(|()| ()).is_ok()
+}
 
 /// How long the overlay cursor takes to reach a target. Pointer actions wait
 /// this long so the cursor lands before the real input happens.
@@ -506,7 +522,7 @@ impl Indicator {
 
     /// Sends an event, starting the overlay first if it is not running.
     async fn send(&self, event: &IndicatorEvent) -> bool {
-        if !self.enabled {
+        if !self.enabled || activity_indicator_suppressed() {
             return false;
         }
         let (Some(socket), Some(path)) = (&self.socket, &self.path) else {
@@ -650,6 +666,18 @@ fn spawn_overlay() -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn activity_suppression_is_task_local_and_restores_after_scope() {
+        assert!(!activity_indicator_suppressed());
+        without_activity_indicator(async {
+            assert!(activity_indicator_suppressed());
+            let concurrent = tokio::spawn(async { activity_indicator_suppressed() });
+            assert!(!concurrent.await.unwrap());
+        })
+        .await;
+        assert!(!activity_indicator_suppressed());
+    }
+
     #[test]
     fn agent_names_come_from_client_info() {
         assert_eq!(agent_display_name("claude-code", None), "Claude");
@@ -713,6 +741,29 @@ mod tests {
             overlay: Mutex::new(Overlay::Unavailable),
             capture_handshake: tokio::sync::Mutex::new(()),
         }
+    }
+
+    #[tokio::test]
+    async fn suppressed_task_sends_no_indicator_events() {
+        let dir = scratch_dir("jev-suppressed");
+        let socket = dir.join(SOCKET_NAME);
+        let overlay = UnixDatagram::bind(&socket).unwrap();
+        overlay.set_nonblocking(true).unwrap();
+        let sender = sender_for(&socket, true);
+
+        without_activity_indicator(async {
+            sender.action("click").await;
+            sender.keys("ctrl+l", false).await;
+        })
+        .await;
+
+        let mut buf = [0u8; 128];
+        assert_eq!(
+            overlay.recv(&mut buf).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+        assert!(!activity_indicator_suppressed());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn scratch_dir(name: &str) -> PathBuf {

@@ -355,6 +355,28 @@ test_enabled_gnome_extension_is_upgraded() (
     assert_contains "${output}" 'log out and back in' || return 1
 )
 
+test_system_gnome_extension_does_not_create_user_shadow() (
+    local extension_uuid="computer-use-linux@avifenesh.dev"
+    export XDG_SESSION_TYPE=wayland
+    export XDG_CURRENT_DESKTOP=GNOME
+    export XDG_DATA_HOME="$(mktemp -d)"
+    export COMPUTER_USE_LINUX_SYSTEM_EXTENSIONS_DIR="${XDG_DATA_HOME}/system-extensions"
+    trap 'rm -rf -- "${XDG_DATA_HOME}"' EXIT
+    mkdir -p "${COMPUTER_USE_LINUX_SYSTEM_EXTENSIONS_DIR}/${extension_uuid}"
+    : >"${COMPUTER_USE_LINUX_SYSTEM_EXTENSIONS_DIR}/${extension_uuid}/metadata.json"
+
+    # shellcheck source=../install.sh
+    source "${INSTALLER}"
+    gnome-extensions() {
+        [[ "$1" == "enable" && "$2" == "${EXT_UUID}" ]]
+    }
+
+    local output
+    output="$(install_gnome_extension)" || return 1
+    assert_contains "${output}" "system extension ${EXT_UUID} is enabled" || return 1
+    [[ ! -e "${XDG_DATA_HOME}/gnome-shell/extensions/${EXT_UUID}" ]]
+)
+
 run_test() {
     local name="$1" test_fn="$2"
     if "${test_fn}"; then
@@ -382,3 +404,4 @@ run_test "doctor raw fallback accepts platform capability blockers" test_doctor_
 run_test "doctor raw fallback rejects missing install prerequisites" test_doctor_raw_fallback_rejects_missing_install_prerequisite
 
 run_test "enabled GNOME extension assets are upgraded" test_enabled_gnome_extension_is_upgraded
+run_test "system GNOME extension does not get shadowed in the user directory" test_system_gnome_extension_does_not_create_user_shadow

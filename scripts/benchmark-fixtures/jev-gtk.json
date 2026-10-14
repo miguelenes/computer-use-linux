@@ -1,0 +1,37 @@
+{
+  "scenarios": [
+    {
+      "name": "enable alpha",
+      "app_name": "computer-use-linux-benchmark",
+      "task": "Click the Enable Alpha button to activate Alpha.",
+      "allowlist": ["click"],
+      "reset_actions": [{"operation": "click", "role": "button", "name": "Reset"}],
+      "precondition": {"kind": "element_present", "role": "label", "name": "Ready"},
+      "atomic_actions": [{"operation": "click", "role": "button", "name": "Enable Alpha"}],
+      "postcondition": {"kind": "element_present", "role": "label", "name": "Alpha enabled"},
+      "max_steps": 1
+    },
+    {
+      "name": "enable beta",
+      "app_name": "computer-use-linux-benchmark",
+      "task": "Click the Enable Beta button to activate Beta.",
+      "allowlist": ["click"],
+      "reset_actions": [{"operation": "click", "role": "button", "name": "Reset"}],
+      "precondition": {"kind": "element_present", "role": "label", "name": "Ready"},
+      "atomic_actions": [{"operation": "click", "role": "button", "name": "Enable Beta"}],
+      "postcondition": {"kind": "element_present", "role": "label", "name": "Beta enabled"},
+      "max_steps": 1
+    },
+    {
+      "name": "enable gamma",
+      "app_name": "computer-use-linux-benchmark",
+      "task": "Click the Enable Gamma button to activate Gamma.",
+      "allowlist": ["click"],
+      "reset_actions": [{"operation": "click", "role": "button", "name": "Reset"}],
+      "precondition": {"kind": "element_present", "role": "label", "name": "Ready"},
+      "atomic_actions": [{"operation": "click", "role": "button", "name": "Enable Gamma"}],
+      "postcondition": {"kind": "element_present", "role": "label", "name": "Gamma enabled"},
+      "max_steps": 1
+    }
+  ]
+}

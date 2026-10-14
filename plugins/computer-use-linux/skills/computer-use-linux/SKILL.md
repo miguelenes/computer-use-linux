@@ -9,6 +9,24 @@ compatibility: "Native Pi tools require Pi 0.84.4+ and Node.js 22.19+; the stand
 
 # computer-use-linux
 
+## Optional isolated desktop VM
+
+The separate Rust CLI offers opt-in VM management on Debian, Ubuntu, and
+AnduinOS apt hosts. From a source checkout, run
+`computer-use-linux vm check`, then
+`computer-use-linux vm setup --checkout /path/to/computer-use-linux`. It
+previews confirmed host setup stages and the pinned image download. Open the
+guest console, log into GNOME Wayland, and run
+`computer-use-linux vm post-login` from a terminal in the mounted checkout to
+finish accessibility and session setup without rebuilding. Then install the
+chosen MCP host in the guest and configure local stdio with
+`command: computer-use-linux`, `args: ["mcp"]`. The MCP host must run in the
+guest's logged-in desktop session. You handle client login and portal consent;
+VM setup does not expose a network MCP endpoint or configure a client.
+`vm stop` and `vm suspend` preserve guest data; `vm destroy` removes the guest
+disk. See the repository README for sync modes, resource controls, and
+recovery steps.
+
 Use `computer-use-linux` when an agent needs to observe or operate a local Linux desktop: inspect the accessibility tree, list/focus windows, take screenshots, click, scroll, type, press keys, or invoke AT-SPI actions.
 
 ## When to Use

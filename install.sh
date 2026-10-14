@@ -28,6 +28,7 @@ COSMIC_HELPER_INSTALL_PATH="${INSTALL_DIR}/${COSMIC_HELPER_NAME}"
 INDICATOR_INSTALL_PATH="${INSTALL_DIR}/${INDICATOR_NAME}"
 EXT_UUID="computer-use-linux@avifenesh.dev"
 EXT_SRC_DIR="${SCRIPT_DIR}/gnome-shell-extension/${EXT_UUID}"
+EXT_SYSTEM_DIR="${COMPUTER_USE_LINUX_SYSTEM_EXTENSIONS_DIR:-/usr/share/gnome-shell/extensions}"
 
 # Color helpers (degrade gracefully when not on a tty).
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
@@ -598,6 +599,18 @@ install_gnome_extension() {
     fi
     if [[ ! -d "${EXT_SRC_DIR}" ]]; then
         log_warn "extension source directory not found at ${EXT_SRC_DIR} — skipping"
+        return 0
+    fi
+
+    # VM provisioning installs this extension system-wide and enables it via
+    # dconf before the first GNOME Shell starts. Do not create a user copy that
+    # shadows that already-loaded system extension during post-login setup.
+    if [[ -f "${EXT_SYSTEM_DIR}/${EXT_UUID}/metadata.json" ]]; then
+        if gnome-extensions enable "${EXT_UUID}" 2>/dev/null; then
+            log_ok "system extension ${EXT_UUID} is enabled"
+        else
+            log_warn "system extension ${EXT_UUID} is installed; GNOME Shell will load it on the next session start"
+        fi
         return 0
     fi
 

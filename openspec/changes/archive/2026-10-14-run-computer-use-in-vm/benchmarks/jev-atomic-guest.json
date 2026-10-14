@@ -1,0 +1,51 @@
+{
+  "benchmark": "computer-use-linux-jev-tasks-v1",
+  "sample_count_per_mode": 30,
+  "scenario_count": 3,
+  "task_mix": [
+    "enable alpha",
+    "enable beta",
+    "enable gamma"
+  ],
+  "resources": {
+    "platform": "Linux-7.0.0-22-generic-x86_64-with-glibc2.43",
+    "machine": "x86_64",
+    "cpu_count": 8,
+    "mem_available_mib": 7098,
+    "mem_total_mib": 7928,
+    "cgroup_memory_limit_mib": null,
+    "cgroup_cpu_quota": null,
+    "vm_product_name": "Ubuntu 26.04 PC (i440FX + PIIX, 1996)",
+    "host_cpus": 24,
+    "host_memory_mib": 49152
+  },
+  "indicator_enabled_for_server": true,
+  "display_profile": "SPICE 848x480; GNOME Shell 50.1 Wayland; guest 8 vCPU 8192 MiB",
+  "atomic": {
+    "latency": {
+      "p50_ms": 461.441,
+      "p95_ms": 480.643,
+      "mean_ms": 464.372
+    },
+    "verified_completed": 30,
+    "completion_rate": 1.0
+  },
+  "jev": {
+    "latency": {
+      "p50_ms": 639.94,
+      "p95_ms": 734.009,
+      "mean_ms": 647.764
+    },
+    "provider_latency": {
+      "p50_ms": 248.0,
+      "p95_ms": 337.0,
+      "mean_ms": 256.733
+    },
+    "verified_completed": 30,
+    "completion_rate": 1.0
+  },
+  "speedup_gate_passed": false,
+  "claim_speedup": false,
+  "gate": "Jev p50 must be <= half atomic p50, Jev p95 must not regress, and independently verified completion must not decrease.",
+  "note": "Both modes use the same task fixture. Reset actions run outside measured time. The postcondition is checked again through fresh AT-SPI state after each task."
+}
