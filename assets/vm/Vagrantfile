@@ -1,0 +1,46 @@
+# Embedded with the CLI and staged into the per-user VM workspace.
+ENV["VAGRANT_DEFAULT_PROVIDER"] ||= "libvirt"
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "bento/ubuntu-26.04"
+  config.vm.box_version = "202606.01.0"
+  config.vm.hostname = "computer-use-linux-guest"
+
+  checkout = ENV.fetch("COMPUTER_USE_LINUX_VM_CHECKOUT")
+  sync_mode = ENV.fetch("COMPUTER_USE_LINUX_VM_SYNC")
+  config.vm.synced_folder checkout, "/workspace/computer-use-linux", type: sync_mode
+
+  config.vm.provider :libvirt do |libvirt|
+    libvirt.uri = "qemu:///system"
+    # The plugin otherwise selects its software QEMU driver even though the
+    # host has KVM; host-passthrough CPU mode only works with the KVM driver.
+    libvirt.driver = "kvm"
+    firmware_pairs = [
+      ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"],
+      ["/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"],
+    ]
+    firmware = firmware_pairs.find do |code, vars|
+      File.file?(code) && File.file?(vars)
+    end
+    raise "OVMF UEFI firmware is missing; install the ovmf package and rerun computer-use-linux vm setup" unless firmware
+
+    libvirt.loader = firmware[0]
+    # System libvirt runs QEMU under its service account, which cannot read
+    # files beneath a user's home directory. Let libvirt create and own the
+    # per-user NVRAM file from the OVMF template.
+    user = ENV.fetch("USER", "user").gsub(/[^a-zA-Z0-9_-]/, "_")
+    libvirt.nvram = "/var/lib/libvirt/qemu/nvram/computer-use-linux-#{user}_VARS.fd"
+    libvirt.cpus = Integer(ENV.fetch("COMPUTER_USE_LINUX_VM_CPUS"))
+    libvirt.memory = Integer(ENV.fetch("COMPUTER_USE_LINUX_VM_MEMORY_MIB"))
+    libvirt.cpu_mode = "host-passthrough"
+    libvirt.disk_bus = "virtio"
+    libvirt.nic_model_type = "virtio"
+    libvirt.graphics_type = "spice"
+    # Explicitly bind SPICE to loopback. Vagrant-libvirt's autoport setting is
+    # ignored for SPICE by some releases, which leaves a console with no port.
+    libvirt.graphics_port = 5937
+    libvirt.graphics_ip = "127.0.0.1"
+  end
+
+  config.vm.provision "shell", path: "provision.sh", privileged: true
+end

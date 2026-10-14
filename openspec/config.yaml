@@ -1,0 +1,38 @@
+schema: spec-driven
+
+context: |
+  This repository is a fork of agent-sh/computer-use-linux. Proposals and
+  implementation tasks target this fork; do not assume that changes are
+  intended for upstream or that upstream issues, releases, or publishing have
+  been handled.
+
+  The project controls real Linux desktops through MCP. Preserve the MCP
+  safety contract: keep tool annotations accurate, maintain safe defaults, and
+  make permission and side-effect boundaries explicit when behavior changes.
+
+  Treat compositor, desktop-session, portal, accessibility, and input-backend
+  behavior as environment-specific. State the Linux desktop/session used for
+  validation and do not claim support or runtime verification beyond the
+  environments actually exercised.
+
+rules:
+  proposal:
+    - Keep proposals focused and identify user-visible behavior, safety implications, and relevant validation.
+    - Do not present fork-specific work as an upstream change or commitment.
+  specs:
+    - Describe observable behavior and preserve explicit safety and permission boundaries for MCP tools.
+    - Avoid promising compositor or desktop-session support without a concrete compatibility basis.
+  tasks:
+    - Include the applicable contribution checks from CONTRIBUTING.md; do not require unrelated gates.
+    - For user-facing command changes, include updates to README.md, npm/README.md, and skills/computer-use-linux/SKILL.md as applicable.
+    - When changing skills/computer-use-linux/, include syncing it to plugins/computer-use-linux/skills/ and running scripts/check_plugins.sh.
+    - For behavior or backend changes, include validation on a named Linux desktop/session and capture relevant computer-use-linux doctor output for compositor, portal, or accessibility issues.
+
+operations:
+  apply:
+    guidance:
+      - Follow CONTRIBUTING.md for the applicable Rust, installer, MCP safety, plugin, and npm packaging checks.
+      - Keep changes focused and preserve existing MCP safety annotations when changing tools.
+  archive:
+    guidance:
+      - Record which applicable contribution checks passed and identify any desktop/session validation that was unavailable.

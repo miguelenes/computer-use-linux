@@ -96,6 +96,22 @@ If you already built or installed the binary yourself, set
 `COMPUTER_USE_LINUX_BIN=/path/to/computer-use-linux` to make the wrapper use
 that executable instead.
 
+## Optional isolated desktop VM
+
+VM support is opt-in and requires the Rust CLI plus a source checkout. On
+Debian, Ubuntu, or AnduinOS apt hosts, run `computer-use-linux vm check` and
+`computer-use-linux vm setup --checkout /path/to/computer-use-linux`. The
+setup command previews each host change and pinned guest image download before
+asking for confirmation. See the repository README's **Optional isolated
+desktop VM** section for prerequisites, resource and sync settings, recovery,
+and lifecycle commands.
+
+Install and run your chosen MCP host inside the guest's logged-in GNOME
+Wayland session. Configure the server as local stdio (`command:
+computer-use-linux`, `args: ["mcp"]`); no network MCP listener is created.
+You handle client login and guest portal consent yourself. A host-side SSH
+launch cannot access the guest's active desktop session.
+
 X11 text input sends LF and CRLF line endings as Return. Focused terminals
 accept keyboard input even when AT-SPI does not expose EditableText. Focus
 feedback describes the target; re-observe its contents to confirm input.

@@ -140,6 +140,214 @@ computer-use-linux screenshot                           # JSON screenshot summar
 computer-use-linux windows
 ```
 
+### Optional isolated desktop VM
+
+VM use is opt-in. Existing direct-host installation remains the default, and
+`computer-use-linux setup` still enables AT-SPI toolkit accessibility for the
+current desktop. VM management uses a separate command group:
+
+```bash
+computer-use-linux vm check --checkout /path/to/computer-use-linux
+computer-use-linux vm setup --checkout /path/to/computer-use-linux --sync auto
+computer-use-linux vm start
+computer-use-linux vm status
+computer-use-linux vm console
+computer-use-linux vm stop
+computer-use-linux vm suspend
+computer-use-linux vm destroy
+computer-use-linux vm optimize
+computer-use-linux vm optimize --cpus 4 --memory-mib 6144
+computer-use-linux vm post-login --checkout /workspace/computer-use-linux
+```
+
+`vm check` is read-only and reports host virtualization, provider, resources,
+and checkout readiness as JSON. `--checkout` selects the fork checkout whose
+source is shared with and built inside the guest; when omitted, the command
+uses `COMPUTER_USE_LINUX_VM_CHECKOUT` or the current directory if it is this
+repository. The other commands operate only on the VM workflow. `vm destroy`
+removes guest-local VM state; use `vm stop` or `vm suspend` to preserve it.
+The VM workflow does not silently fall back to controlling the host desktop.
+
+Automated host setup is currently limited to Debian, Ubuntu, and AnduinOS apt
+hosts. `vm setup` displays package, service, group, plugin, resource, and sync
+stages and asks before each change. A declined stage stops later setup stages;
+rerun the printed command to resume. The guest image name, pinned version, and
+download size are shown before Vagrant downloads it. The default profile keeps
+two CPU cores and 4 GiB of available memory for the host, caps the guest at 8
+vCPUs and 8 GiB, and refuses to choose automatic resources below a 4 GiB guest
+memory floor. `--cpus`, `--memory-mib`, and `--sync auto|virtiofs|rsync` select
+per-user VM settings. `auto` uses virtiofs only when both host support pieces
+are present; otherwise it reports and selects rsync. The VM always uses
+`qemu:///system`, KVM/libvirt, host-passthrough CPU, virtio devices, and a
+loopback SPICE console.
+
+Host setup is automated only for Debian, Ubuntu, and AnduinOS with apt. It may
+ask for your password to install packages, enable libvirt, add your account to
+the `kvm` and `libvirt` groups, and install the per-user Vagrant plugin. Review
+each displayed stage before confirming it. Log out and back in after a group
+change; if libvirt was just installed, setup enables and starts its service.
+The pinned `bento/ubuntu-26.04` version `202606.01.0` image is downloaded only
+after its provider and byte size are displayed and you confirm. Declining or
+failing a later stage preserves earlier work; rerun the printed `vm setup`
+command to resume. Setup skips the image download when that exact libvirt box
+version is already cached.
+
+`vm setup` reboots the guest after provisioning so GDM starts the local
+`vagrant` account in a fresh GNOME Wayland session. This affects the guest
+only. Provisioning installs
+the GNOME extension system-wide and sets AT-SPI and enabled-extension dconf
+defaults before the first Shell starts. A desktop autostart task runs
+`computer-use-linux vm post-login` once in the graphical Wayland session; it
+runs the existing `install.sh` without system-package, Rust, or build steps,
+then runs `computer-use-linux doctor`. No manual login, logout, Shell restart,
+or terminal command is required for setup. Keep the SPICE console
+local to the host. An SSH shell still does not carry the active
+Wayland/session-bus context. If you used rsync sync mode, rerun `vm setup` after
+host checkout changes to refresh the guest snapshot; virtiofs reflects the
+checkout directly.
+
+Choose an MCP host installed inside the guest and configure it to launch
+`computer-use-linux mcp` over local stdio, for example:
+
+```json
+{
+  "command": "computer-use-linux",
+  "args": ["mcp"]
+}
+```
+
+Start that MCP host from the same logged-in GNOME session. The CLI does not
+install a client, write its configuration, forward an MCP network endpoint,
+log in, or accept a desktop portal prompt. Complete client login and any
+screenshot/input portal consent yourself inside the guest. Host home folders,
+desktop buses, and input devices are never passed through. `vm stop` and `vm
+suspend` preserve guest data. `vm destroy` removes the guest disk and its
+installed applications.
+
+The optional `COMPUTER_USE_LINUX_INDICATOR=0` setting hides the guest's visible
+action cue while the MCP server runs. The cue is on by default; turning it off
+removes the on-screen indication that the server is acting. VM tuning through
+`vm optimize` changes only this VM's CPU, memory, and checkout-sync profile.
+Compare screenshots, accessibility reads, and input p50/p95 on the same host,
+guest, and display profile before making any speed claim. These primitive
+measurements do not show that multi-step tasks or Jev are faster.
+
+To collect primitive latency samples from either a native host or the guest,
+use the existing Tilix terminal window and its reversible menu toggle. The VM
+provisioner includes the same Tilix package for an equivalent guest workload.
+This
+avoids typing into an editor or relying on an exact window id for a desktop
+capture:
+
+```bash
+COMPUTER_USE_LINUX_SCREENSHOT_BACKEND=gnome-screenshot python3 scripts/benchmark_primitives.py --mode native --app tilix --screenshot-scope display --input-scope atspi-action --input-toggle-name Menu --display-profile "AnduinOS 2.0.4 GNOME Wayland, HDMI-1/HDMI-2, 2x2560x1440 logical" --samples 20 --output native.json
+# In the guest, leave screenshot backend selection automatic:
+python3 scripts/benchmark_primitives.py --mode guest --app tilix --screenshot-scope display --input-scope atspi-action --input-toggle-name Menu --host-cpus 24 --host-memory-mib 49152 --display-profile "SPICE GNOME Wayland, 848x480" --samples 20 --output guest.json
+```
+
+The harness requires a scoped AT-SPI app name and, for targeted captures or
+input, a fresh window id. Display captures and the reversible AT-SPI toggle do
+not need one. It reports screenshot, accessibility-read, and input p50/p95
+with host/guest resources, display, and indicator metadata. Use the same sample
+count, toggle name, screenshot dimensions, and indicator setting for both
+runs. The report also records the capture backend and both returned and
+coordinate-space screenshot dimensions. Each toggle is read back, restored,
+and independently verified within the sample. On the currently tested guest,
+forcing `gnome-screenshot` fails because the CLI returns success without
+creating an image, so leave the guest backend automatic; it uses the XDG Screenshot portal. That guest
+portal capture and the native `gnome-screenshot` capture are different
+profiles, and their screenshot timings must not be treated as a direct
+comparison. A screenshot comparison needs the same backend and source
+dimensions. The script reports primitive timings only and does not make a
+speedup claim.
+
+### Optional Jev task orchestration
+
+The `run_jev_task` MCP tool is absent unless the MCP server process has both
+`COMPUTER_USE_LINUX_ENABLE_JEV=1` and a nonempty `TYPESAFE_API_KEY`. Put these
+variables in the selected MCP host's guest-local environment, then restart
+that host. Missing or malformed configuration leaves atomic tools available
+and the Jev tool unregistered. The key is sent to the TypeSafe System One
+endpoint only as its HTTP bearer credential. It is removed from the curl
+child's environment and never appears in decision JSON, tool diagnostics, or
+results. Jev is a decision service and each request incurs provider latency.
+`run_jev_task` suppresses its own on-screen action indicator while it runs;
+direct atomic tools keep the configured indicator behavior.
+
+Each call must provide a task description (at most 2,000 characters), a
+specific AT-SPI app name, an action allowlist (`click`, `perform_action`, and
+optionally `type_text`), and one supported postcondition:
+
+```json
+{
+  "kind": "element_present",
+  "role": "push button",
+  "name": "Continue"
+}
+```
+
+The other predicates are `element_enabled` with the same role/name fields,
+and `field_value_equals` with an exact `value`. Missing and unsupported
+predicates are rejected before any action. The server sends Jev a redacted,
+bounded task description, a scoped compact accessibility summary, and fresh
+candidate IDs with safe action descriptions. It does not send screenshot
+pixels, environment variables, caller postconditions, or caller typing text.
+When `type_text` is allowlisted, the caller must supply the literal text; the
+server only sends it to the selected app after Jev picks that candidate. Jev
+cannot provide commands, selectors, action arguments, or replacement text.
+
+The hard action budget is five. Candidate IDs are regenerated after each
+observation, low-confidence, malformed, stale, unavailable, and abstaining
+decisions stop without dispatching an action, and state is observed again
+after each action. Success is returned only after a deterministic server check
+of the requested predicate against fresh AT-SPI state. Tool hosts should
+approve this mutating tool as they do other desktop input. Keep atomic tools
+for direct primitive calls. A separate repeated guest benchmark must compare
+the same end-to-end tasks, include Jev latency, report p50/p95 and independently
+verified completion, and meet the documented 2x median/no-p95-regression/no
+completion-loss gate before any Jev speedup claim. Primitive timings above do
+not satisfy that gate.
+
+The repository includes a disposable GTK benchmark fixture with three
+independent buttons and a Reset button. It changes only an accessible status
+label and performs no file, network, or shell operations. Launch it separately
+in the native session and the guest session with `/usr/bin/python3
+scripts/benchmark_fixture.py` (inside the guest, use the checkout path under
+`/workspace/computer-use-linux`).
+
+Run the end-to-end comparison with an identical JSON fixture for both paths.
+The included `scripts/benchmark-fixtures/jev-gtk.json` runs three safe,
+repeatable scenarios against the GTK fixture and checks that Reset restores
+the same starting condition before each sample. Each scenario must include a unique
+name, scoped AT-SPI `app_name`, task description, Jev action allowlist,
+supported postcondition, and a sequence of equivalent atomic actions.
+`window_id` is optional for app-scoped reads and semantic accessibility
+actions. Keyboard actions in the atomic path must also provide at least one
+input selector (`window_id`, `pid`, `app_id`, `wm_class`, or `title`) so the
+benchmark never types into whichever window happens to have focus. Optional reset
+actions restore the same starting state before each sample and are excluded
+from timing. The benchmark alternates execution order, verifies the predicate
+again through fresh scoped AT-SPI state, and reports provider latency separately
+from full task latency. It records guest resources, the indicator setting, and
+the supplied display profile; pass physical host resources when running inside
+the VM.
+
+```bash
+python3 scripts/benchmark_jev_tasks.py jev-task-fixtures.json \
+  --samples 20 --display-profile "SPICE 1600x900, 8 vCPU, 8192 MiB" \
+  --host-cpus 24 --host-memory-mib 49152 --output jev-task-results.json
+```
+
+For the included fixture, pass `scripts/benchmark-fixtures/jev-gtk.json` as the
+first argument instead of `jev-task-fixtures.json`.
+
+The script requires `run_jev_task` to be registered by the opted-in guest MCP
+server. Use at least three scenarios with repeatable starting states; results
+with failed tool calls count as incomplete. This benchmark is separate from the
+primitive benchmark above. It measures complete tasks, including the Jev
+request and observation round trips, and reports whether the speedup gate
+passed; a failed gate means no speedup claim.
+
 ## Support matrix
 
 Validated manually on Ubuntu 25.10 (GNOME Shell 50.1, Wayland). niri window listing and exact focus were also validated on Ubuntu 26.10 (development), niri 26.04, with a single 2x output, through both CLI and direct IPC. Other compositor backends are implemented and covered by parser / contract tests, but real desktop behavior still depends on each session exposing its expected control API.

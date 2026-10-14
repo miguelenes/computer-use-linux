@@ -127,13 +127,14 @@ pub(crate) async fn run_from_env() -> Result<()> {
             );
             Ok(())
         }
+        Some("vm") => vm_command(&std::env::args().skip(2).collect::<Vec<_>>()).await,
         Some("--help") | Some("-h") => {
             print_help();
             Ok(())
         }
         Some(command) => {
             anyhow::bail!(
-                "unknown command '{command}'. Expected one of: mcp, doctor, setup, guard-accessibility, apps, state, screenshot, windows, setup-window-targeting"
+                "unknown command '{command}'. Expected one of: mcp, doctor, setup, guard-accessibility, apps, state, screenshot, windows, setup-window-targeting, vm"
             );
         }
         None => {
@@ -141,6 +142,124 @@ pub(crate) async fn run_from_env() -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn vm_command(args: &[String]) -> Result<()> {
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        print_vm_help();
+        return Ok(());
+    };
+    if matches!(subcommand, "check" | "setup")
+        && args
+            .iter()
+            .skip(1)
+            .any(|arg| arg == "--help" || arg == "-h")
+    {
+        println!("computer-use-linux vm {subcommand} [--checkout PATH]");
+        return Ok(());
+    }
+
+    match subcommand {
+        "--help" | "-h" | "help" => print_vm_help(),
+        "check" => {
+            let (checkout, overrides) = vm_options(args)?;
+            if overrides.cpus.is_some() || overrides.memory_mib.is_some() || overrides.sync_mode.is_some() {
+                anyhow::bail!("resource and sync overrides are available on `vm setup`, not `vm check`");
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::vm::check(checkout.as_deref())?)?
+            );
+        }
+        "setup" => {
+            let (checkout, overrides) = vm_options(args)?;
+            crate::vm::run_setup(checkout.as_deref(), &overrides)?;
+        }
+        "start" | "status" | "console" | "stop" | "suspend" | "destroy" | "optimize" | "post-login" => {
+            if args.iter().skip(1).any(|arg| arg == "--help" || arg == "-h") {
+                println!("computer-use-linux vm {subcommand} [OPTIONS]");
+                return Ok(());
+            }
+            let (checkout, overrides) = vm_options(args)?;
+            if checkout.is_some() && subcommand != "post-login" {
+                anyhow::bail!("--checkout is accepted only by `vm check` and `vm setup`");
+            }
+            if subcommand != "optimize"
+                && (overrides.cpus.is_some()
+                    || overrides.memory_mib.is_some()
+                    || overrides.sync_mode.is_some())
+            {
+                anyhow::bail!("resource and sync overrides are accepted by `vm setup` and `vm optimize`");
+            }
+            if subcommand == "post-login"
+                && (overrides.cpus.is_some()
+                    || overrides.memory_mib.is_some()
+                    || overrides.sync_mode.is_some())
+            {
+                anyhow::bail!("resource and sync overrides do not apply to `vm post-login`");
+            }
+            crate::vm::lifecycle(subcommand, &overrides, checkout.as_deref())?;
+        }
+        other => anyhow::bail!("unknown VM command '{other}'. Expected one of: check, setup, start, status, console, stop, suspend, destroy, optimize, post-login"),
+    }
+    Ok(())
+}
+
+fn vm_options(args: &[String]) -> Result<(Option<std::path::PathBuf>, crate::vm::VmOverrides)> {
+    let mut checkout = None;
+    let mut overrides = crate::vm::VmOverrides::default();
+    let mut args = args.iter().skip(1);
+    while let Some(argument) = args.next() {
+        let (name, inline_value) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(name, value)| {
+                (name, Some(value))
+            });
+        match name {
+            "--checkout" => {
+                let path = inline_value
+                    .map(str::to_string)
+                    .or_else(|| args.next().cloned())
+                    .context("--checkout requires a source checkout path")?;
+                checkout = Some(std::path::PathBuf::from(path));
+            }
+            "--cpus" => {
+                let value = inline_value
+                    .map(str::to_string)
+                    .or_else(|| args.next().cloned())
+                    .context("--cpus requires a number from 1 to 8")?;
+                overrides.cpus = Some(value.parse().context("--cpus must be a positive integer")?);
+            }
+            "--memory-mib" => {
+                let value = inline_value
+                    .map(str::to_string)
+                    .or_else(|| args.next().cloned())
+                    .context("--memory-mib requires an integer number of MiB")?;
+                overrides.memory_mib =
+                    Some(value.parse().context("--memory-mib must be an integer")?);
+            }
+            "--sync" => {
+                let value = inline_value
+                    .map(str::to_string)
+                    .or_else(|| args.next().cloned())
+                    .context("--sync requires auto, virtiofs, or rsync")?;
+                if !matches!(value.as_str(), "auto" | "virtiofs" | "rsync") {
+                    anyhow::bail!("--sync must be auto, virtiofs, or rsync");
+                }
+                overrides.sync_mode = Some(value);
+            }
+            other => anyhow::bail!("unknown VM option '{other}'"),
+        }
+    }
+    Ok((checkout, overrides))
+}
+
+fn print_vm_help() {
+    println!("{}", vm_help_text());
+}
+
+fn vm_help_text() -> &'static str {
+    "computer-use-linux vm\n\nUsage:\n  computer-use-linux vm check [--checkout PATH]\n  computer-use-linux vm setup [--checkout PATH] [--cpus N] [--memory-mib N] [--sync auto|virtiofs|rsync]\n  computer-use-linux vm start\n  computer-use-linux vm status\n  computer-use-linux vm console\n  computer-use-linux vm stop\n  computer-use-linux vm suspend\n  computer-use-linux vm destroy\n  computer-use-linux vm optimize\n  computer-use-linux vm post-login [--checkout PATH]\n\nRun `vm post-login` from the checkout inside the guest's logged-in GNOME Wayland session. It runs the existing installer without rebuilding.\n`computer-use-linux setup` continues to enable AT-SPI on the current desktop."
 }
 
 fn abs_test_report(
@@ -167,7 +286,7 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
-    use super::{abs_pointer, abs_test_report};
+    use super::{abs_pointer, abs_test_report, vm_help_text};
 
     #[test]
     fn abs_test_report_distinguishes_requested_and_emitted_coordinates() {
@@ -189,5 +308,17 @@ mod tests {
                 "h": 1080
             })
         );
+    }
+
+    #[test]
+    fn vm_help_keeps_vm_setup_distinct_from_accessibility_setup() {
+        let help = vm_help_text();
+        for command in [
+            "check", "setup", "start", "status", "console", "stop", "suspend", "destroy",
+            "optimize",
+        ] {
+            assert!(help.contains(&format!("computer-use-linux vm {command}")));
+        }
+        assert!(help.contains("computer-use-linux setup` continues to enable AT-SPI"));
     }
 }

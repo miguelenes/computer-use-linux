@@ -6,6 +6,7 @@ use crate::atspi_tree::{
 };
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
 use crate::gnome_extension::{setup_window_targeting_report, WindowTargetingSetupReport};
+use crate::jev;
 use crate::remote_desktop::{
     click as portal_click, drag as portal_drag, keysyms_for_text, press_key_chord,
     press_keycode_chord, scroll as portal_scroll, start_portal_keyboard_session,
@@ -66,6 +67,13 @@ const SHELL_MAX_CWD_BYTES: usize = 4096;
 const SHELL_MAX_ENV_ENTRIES: usize = 64;
 const SHELL_MAX_ENV_BYTES: usize = 64 * 1024;
 const SHELL_RESPONSE_STREAM_BYTES: usize = 512 * 1024;
+const JEV_MAX_TASK_CHARS: usize = 500;
+const JEV_MAX_STEPS: u8 = 5;
+const JEV_MAX_CANDIDATES: usize = 30;
+const JEV_ACCESSIBILITY_MAX_NODES: usize = 350;
+const JEV_ACCESSIBILITY_MAX_DEPTH: u32 = 32;
+const JEV_POSTCONDITION_POLL_ATTEMPTS: usize = 30;
+const JEV_POSTCONDITION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Nodes and their app ownership must come from the same snapshot.
 #[derive(Default)]
@@ -133,6 +141,12 @@ impl ComputerUseLinux {
         if !shell_execution_enabled() {
             router.map.remove("run_shell");
         }
+        if !jev::configured() {
+            if let Some(message) = jev::configuration_message() {
+                eprintln!("computer-use-linux: {message}");
+            }
+            router.map.remove("run_jev_task");
+        }
         for route in router.map.values_mut() {
             let input_schema = Arc::make_mut(&mut route.attr.input_schema);
             for value in input_schema.values_mut() {
@@ -150,6 +164,272 @@ impl ComputerUseLinux {
 
 #[tool_router]
 impl ComputerUseLinux {
+    #[tool(
+        name = "run_jev_task",
+        description = "Run a bounded desktop task by letting Jev choose among fresh server-built actions. Disabled unless COMPUTER_USE_LINUX_ENABLE_JEV=1 and TYPESAFE_API_KEY are set. Requires a supported structured postcondition; literal typing, when allowed, uses only caller-supplied text.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn run_jev_task(
+        &self,
+        Parameters(params): Parameters<JevTaskParams>,
+    ) -> Json<JevTaskOutput> {
+        Json(self.run_jev_task_inner(params).await)
+    }
+
+    async fn run_jev_task_inner(&self, params: JevTaskParams) -> JevTaskOutput {
+        let Some(error) = validate_jev_params(&params) else {
+            return crate::indicator::without_activity_indicator(self.execute_jev_task(params))
+                .await;
+        };
+        JevTaskOutput::failed(error, 0, false)
+    }
+
+    async fn execute_jev_task(&self, params: JevTaskParams) -> JevTaskOutput {
+        let task = redact_caller_text(&params.task, JEV_MAX_TASK_CHARS);
+        let mut completed_steps = 0u8;
+        let mut jev_latency_ms = 0u64;
+        for _ in 0..params.max_steps {
+            let snapshot = match crate::atspi_tree::snapshot_accessibility_tree(
+                Some(&params.app_name),
+                None,
+                JEV_ACCESSIBILITY_MAX_NODES,
+                JEV_ACCESSIBILITY_MAX_DEPTH,
+            )
+            .await
+            {
+                Ok(snapshot) if snapshot.scoped && !snapshot.truncated => snapshot,
+                Ok(_) => {
+                    return JevTaskOutput::failed(
+                        "A bounded, scoped accessibility observation is unavailable.".into(),
+                        completed_steps,
+                        false,
+                    );
+                }
+                Err(_) => {
+                    return JevTaskOutput::failed(
+                        "Could not obtain a fresh accessibility observation.".into(),
+                        completed_steps,
+                        false,
+                    );
+                }
+            };
+            self.commit_snapshot(&snapshot.nodes, snapshot.root_pid)
+                .await;
+            if evaluate_jev_postcondition(&params.postcondition, &snapshot.nodes) {
+                return JevTaskOutput::success(completed_steps, jev_latency_ms);
+            }
+
+            let candidates = build_jev_candidates(
+                &snapshot.nodes,
+                &params.action_allowlist,
+                params.literal_text.is_some(),
+                params.window_id,
+            );
+            if candidates.is_empty() {
+                return JevTaskOutput::failed(
+                    "No allowed safe action candidates are available in the scoped observation."
+                        .into(),
+                    completed_steps,
+                    false,
+                );
+            }
+            let ids_and_descriptions = candidates
+                .iter()
+                .map(|candidate| (candidate.id.clone(), candidate.description.clone()))
+                .collect::<Vec<_>>();
+            let context = json_accessibility_context(&snapshot.nodes);
+            let state = serde_json::json!({
+                "task": task,
+                "accessibility": context,
+                "candidates": ids_and_descriptions.iter().map(|(id, description)| serde_json::json!({"id": id, "action": description})).collect::<Vec<_>>(),
+            });
+            let started = std::time::Instant::now();
+            let selected = match tokio::task::spawn_blocking(move || {
+                jev::request_choice(&state, &ids_and_descriptions)
+            })
+            .await
+            {
+                Ok(Ok(selected)) => selected,
+                _ => {
+                    jev_latency_ms =
+                        jev_latency_ms.saturating_add(started.elapsed().as_millis() as u64);
+                    return JevTaskOutput::failed_with_latency(
+                        "Jev did not return a usable candidate; no action was taken.".into(),
+                        completed_steps,
+                        false,
+                        jev_latency_ms,
+                    );
+                }
+            };
+            jev_latency_ms = jev_latency_ms.saturating_add(started.elapsed().as_millis() as u64);
+            let Some(candidate) = candidates.iter().find(|candidate| candidate.id == selected)
+            else {
+                return JevTaskOutput::failed_with_latency(
+                    "Jev selected a stale or unknown candidate; no action was taken.".into(),
+                    completed_steps,
+                    false,
+                    jev_latency_ms,
+                );
+            };
+            let confirmation = match crate::atspi_tree::snapshot_accessibility_tree(
+                Some(&params.app_name),
+                None,
+                JEV_ACCESSIBILITY_MAX_NODES,
+                JEV_ACCESSIBILITY_MAX_DEPTH,
+            )
+            .await
+            {
+                Ok(snapshot) if snapshot.scoped && !snapshot.truncated => snapshot,
+                _ => {
+                    return JevTaskOutput::failed(
+                        "A fresh observation could not validate the selected action; no action was taken.".into(),
+                        completed_steps,
+                        false,
+                    );
+                }
+            };
+            let original_state = serde_json::to_vec(&snapshot.nodes).unwrap_or_default();
+            let confirmed_state = serde_json::to_vec(&confirmation.nodes).unwrap_or_default();
+            if original_state != confirmed_state {
+                // Discard the candidate after any state change. A toolkit may publish
+                // the resulting accessible state just after this confirmation; poll
+                // fresh bounded snapshots briefly so a completed task can still be
+                // verified without applying a stale action.
+                for _ in 0..JEV_POSTCONDITION_POLL_ATTEMPTS {
+                    tokio::time::sleep(JEV_POSTCONDITION_POLL_INTERVAL).await;
+                    if let Ok(snapshot) = crate::atspi_tree::snapshot_accessibility_tree(
+                        Some(&params.app_name),
+                        None,
+                        JEV_ACCESSIBILITY_MAX_NODES,
+                        JEV_ACCESSIBILITY_MAX_DEPTH,
+                    )
+                    .await
+                    {
+                        if snapshot.scoped
+                            && !snapshot.truncated
+                            && evaluate_jev_postcondition(&params.postcondition, &snapshot.nodes)
+                        {
+                            self.commit_snapshot(&snapshot.nodes, snapshot.root_pid)
+                                .await;
+                            return JevTaskOutput::success(completed_steps, jev_latency_ms);
+                        }
+                    }
+                }
+                return JevTaskOutput::failed_with_latency(
+                    "The desktop changed while Jev was deciding; the candidate is stale and no action was taken.".into(),
+                    completed_steps,
+                    false,
+                    jev_latency_ms,
+                );
+            }
+            self.commit_snapshot(&confirmation.nodes, confirmation.root_pid)
+                .await;
+            let action_result = match candidate.operation {
+                JevOperation::Click => {
+                    self.click(Parameters(ClickParams {
+                        element_index: Some(candidate.element_index),
+                        window_id: params.window_id,
+                        ..ClickParams::default()
+                    }))
+                    .await
+                    .0
+                }
+                JevOperation::PerformAction => {
+                    self.perform_action(Parameters(ActionParams {
+                        element_index: Some(candidate.element_index),
+                        action: candidate.action.clone(),
+                        ..ActionParams::default()
+                    }))
+                    .await
+                    .0
+                }
+                JevOperation::TypeText => {
+                    self.type_text(Parameters(TypeTextParams {
+                        text: params.literal_text.clone().unwrap_or_default(),
+                        window_id: params.window_id,
+                        pid: None,
+                        tty: None,
+                        terminal_pid: None,
+                        terminal_command: None,
+                        terminal_cwd: None,
+                        app_id: None,
+                        wm_class: None,
+                        title: None,
+                    }))
+                    .await
+                    .0
+                }
+            };
+            if !action_result.ok {
+                return JevTaskOutput::failed_with_latency(
+                    "The selected action could not be completed safely.".into(),
+                    completed_steps,
+                    false,
+                    jev_latency_ms,
+                );
+            }
+            completed_steps = completed_steps.saturating_add(1);
+            // GTK may return from an action before its accessibility tree reflects
+            // the completed widget transition. Verify the requested state from
+            // bounded fresh snapshots before asking Jev for another decision.
+            for _ in 0..JEV_POSTCONDITION_POLL_ATTEMPTS {
+                tokio::time::sleep(JEV_POSTCONDITION_POLL_INTERVAL).await;
+                if let Ok(snapshot) = crate::atspi_tree::snapshot_accessibility_tree(
+                    Some(&params.app_name),
+                    None,
+                    JEV_ACCESSIBILITY_MAX_NODES,
+                    JEV_ACCESSIBILITY_MAX_DEPTH,
+                )
+                .await
+                {
+                    if snapshot.scoped
+                        && !snapshot.truncated
+                        && evaluate_jev_postcondition(&params.postcondition, &snapshot.nodes)
+                    {
+                        self.commit_snapshot(&snapshot.nodes, snapshot.root_pid)
+                            .await;
+                        return JevTaskOutput::success(completed_steps, jev_latency_ms);
+                    }
+                }
+            }
+        }
+
+        let final_snapshot = match crate::atspi_tree::snapshot_accessibility_tree(
+            Some(&params.app_name),
+            None,
+            JEV_ACCESSIBILITY_MAX_NODES,
+            JEV_ACCESSIBILITY_MAX_DEPTH,
+        )
+        .await
+        {
+            Ok(snapshot) if snapshot.scoped && !snapshot.truncated => snapshot,
+            _ => {
+                return JevTaskOutput::failed(
+                    "Could not independently verify the postcondition after the step budget."
+                        .into(),
+                    completed_steps,
+                    false,
+                );
+            }
+        };
+        if evaluate_jev_postcondition(&params.postcondition, &final_snapshot.nodes) {
+            JevTaskOutput::success(completed_steps, jev_latency_ms)
+        } else {
+            JevTaskOutput::failed_with_latency(
+                "Step budget reached without independently verifying the requested postcondition."
+                    .into(),
+                completed_steps,
+                false,
+                jev_latency_ms,
+            )
+        }
+    }
+
     #[tool(
         name = "complete_interaction",
         description = "Send a desktop notification that this agent has finished its interaction. Available only with COMPUTER_USE_LINUX_NOTIFY_ON_COMPLETE=1. This cue does not acquire or release an exclusive desktop lock. Delivery is best effort and bounded; it may be suppressed by desktop notification settings.",
@@ -3018,6 +3298,329 @@ struct ActionOutput {
     // clients reject.
     #[schemars(skip)]
     received: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct JevTaskParams {
+    /// A caller-provided task description. It is length-bounded and redacted before being sent to Jev.
+    task: String,
+    /// AT-SPI application name used to obtain a scoped observation.
+    app_name: String,
+    /// Operations Jev may choose from: click, perform_action, and/or type_text.
+    action_allowlist: Vec<String>,
+    /// Required structured condition that is checked locally against fresh AT-SPI state.
+    postcondition: JevPostcondition,
+    /// Window to target for input actions. Required when type_text is allowed.
+    #[serde(default)]
+    window_id: Option<u64>,
+    /// Literal text supplied by the caller. Never included in Jev state or results.
+    #[serde(default)]
+    literal_text: Option<String>,
+    /// Hard-bounded decision/action budget (1..=5).
+    max_steps: u8,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct JevPostcondition {
+    /// Supported values: element_present, element_enabled, or field_value_equals.
+    kind: String,
+    role: String,
+    name: String,
+    /// Exact caller-owned value used only for local postcondition verification.
+    #[serde(default)]
+    value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct JevTaskOutput {
+    status: String,
+    verified: bool,
+    steps: u8,
+    jev_latency_ms: u64,
+    message: String,
+}
+
+impl JevTaskOutput {
+    fn success(steps: u8, jev_latency_ms: u64) -> Self {
+        Self {
+            status: "completed".into(),
+            verified: true,
+            steps,
+            jev_latency_ms,
+            message:
+                "The requested postcondition was verified from a fresh accessibility observation."
+                    .into(),
+        }
+    }
+
+    fn failed(message: String, steps: u8, verified: bool) -> Self {
+        Self::failed_with_latency(message, steps, verified, 0)
+    }
+
+    fn failed_with_latency(
+        message: String,
+        steps: u8,
+        verified: bool,
+        jev_latency_ms: u64,
+    ) -> Self {
+        Self {
+            status: "incomplete".into(),
+            verified,
+            steps,
+            jev_latency_ms,
+            message,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum JevOperation {
+    Click,
+    PerformAction,
+    TypeText,
+}
+
+#[derive(Debug, Clone)]
+struct JevCandidate {
+    id: String,
+    operation: JevOperation,
+    element_index: u32,
+    action: Option<String>,
+    description: String,
+}
+
+fn validate_jev_params(params: &JevTaskParams) -> Option<String> {
+    if !jev::configured() {
+        return Some(
+            jev::configuration_message()
+                .unwrap_or("Jev is unavailable.")
+                .into(),
+        );
+    }
+    if params.task.trim().is_empty() || params.task.chars().count() > 2000 {
+        return Some("Task description must contain 1 to 2000 characters.".into());
+    }
+    if params.app_name.trim().is_empty() || params.app_name.chars().count() > 120 {
+        return Some("A bounded AT-SPI application name is required.".into());
+    }
+    if !(1..=JEV_MAX_STEPS).contains(&params.max_steps) {
+        return Some(format!("max_steps must be between 1 and {JEV_MAX_STEPS}."));
+    }
+    if params.action_allowlist.is_empty()
+        || params.action_allowlist.len() > 3
+        || params
+            .action_allowlist
+            .iter()
+            .any(|action| !matches!(action.as_str(), "click" | "perform_action" | "type_text"))
+    {
+        return Some(
+            "action_allowlist must contain only click, perform_action, or type_text.".into(),
+        );
+    }
+    if params
+        .action_allowlist
+        .iter()
+        .any(|action| action == "type_text")
+        && (params.window_id.is_none()
+            || params
+                .literal_text
+                .as_ref()
+                .is_none_or(|text| text.chars().count() > 5000))
+    {
+        return Some(
+            "type_text requires a window_id and caller literal_text of at most 5000 characters."
+                .into(),
+        );
+    }
+    let post = &params.postcondition;
+    if post.role.trim().is_empty()
+        || post.role.chars().count() > 80
+        || post.name.trim().is_empty()
+        || post.name.chars().count() > 160
+    {
+        return Some("postcondition requires a role and an exact, bounded element name.".into());
+    }
+    match post.kind.as_str() {
+        "element_present" | "element_enabled" if post.value.is_none() => None,
+        "field_value_equals" if post.value.as_ref().is_some_and(|value| value.chars().count() <= 5000) => None,
+        _ => Some("postcondition must use element_present, element_enabled, or field_value_equals with supported fields.".into()),
+    }
+}
+
+fn build_jev_candidates(
+    nodes: &[AccessibilityNode],
+    allowlist: &[String],
+    has_literal_text: bool,
+    window_id: Option<u64>,
+) -> Vec<JevCandidate> {
+    let Ok(nonce) = getrandom::u64() else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    for node in nodes
+        .iter()
+        .filter(|node| accessibility_node_is_actionable(node))
+    {
+        let safe_name = redact_caller_text(node.name.as_deref().unwrap_or("unnamed element"), 80);
+        if allowlist.iter().any(|action| action == "click")
+            && node.actions.iter().any(|action| {
+                matches!(
+                    action.name.to_ascii_lowercase().as_str(),
+                    "click" | "press" | "toggle" | "activate"
+                )
+            })
+        {
+            candidates.push(JevCandidate {
+                id: format!("j{nonce:016x}c{}", node.index),
+                operation: JevOperation::Click,
+                element_index: node.index,
+                action: None,
+                description: format!("Click enabled {} named {safe_name}", node.role),
+            });
+        }
+        if allowlist.iter().any(|action| action == "perform_action") {
+            for action in node.actions.iter().filter(|action| {
+                matches!(
+                    action.name.to_ascii_lowercase().as_str(),
+                    "click" | "activate" | "press" | "toggle" | "select" | "focus"
+                )
+            }) {
+                candidates.push(JevCandidate {
+                    id: format!("j{nonce:016x}a{}-{}", node.index, action.index),
+                    operation: JevOperation::PerformAction,
+                    element_index: node.index,
+                    action: Some(action.name.clone()),
+                    description: format!(
+                        "Perform the {} action on enabled {} named {safe_name}",
+                        redact_caller_text(&action.name, 40),
+                        node.role
+                    ),
+                });
+            }
+        }
+        if has_literal_text
+            && window_id.is_some()
+            && node.supports_editable_text
+            && node.states.iter().any(|state| state == "focused")
+            && candidates.len() < JEV_MAX_CANDIDATES
+        {
+            candidates.push(JevCandidate {
+                id: format!("j{nonce:016x}t{}", node.index),
+                operation: JevOperation::TypeText,
+                element_index: node.index,
+                action: None,
+                description: format!("Type the caller-supplied literal text into focused editable {} named {safe_name}", node.role),
+            });
+        }
+        if candidates.len() >= JEV_MAX_CANDIDATES {
+            break;
+        }
+    }
+    candidates.truncate(JEV_MAX_CANDIDATES);
+    candidates
+}
+
+fn accessibility_node_is_actionable(node: &AccessibilityNode) -> bool {
+    // GTK commonly reports actionable widgets as "sensitive" while other
+    // toolkits use the equivalent "enabled" state. Accept either positive
+    // state, but still fail closed when neither is present.
+    node.states
+        .iter()
+        .any(|state| matches!(state.as_str(), "enabled" | "sensitive"))
+}
+
+fn evaluate_jev_postcondition(condition: &JevPostcondition, nodes: &[AccessibilityNode]) -> bool {
+    nodes.iter().any(|node| {
+        if node.role != condition.role || node.name.as_deref() != Some(condition.name.as_str()) {
+            return false;
+        }
+        match condition.kind.as_str() {
+            "element_present" => true,
+            "element_enabled" => node.states.iter().any(|state| state == "enabled"),
+            "field_value_equals" => condition.value.as_deref().is_some_and(|expected| {
+                node.text.as_ref().and_then(|text| text.content.as_deref()) == Some(expected)
+                    || node.value.as_ref().and_then(|value| value.text.as_deref()) == Some(expected)
+            }),
+            _ => false,
+        }
+    })
+}
+
+fn redact_caller_text(input: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    let mut token = String::new();
+    let mut redact_remaining = 0u8;
+    let flush = |token: &mut String, output: &mut String| {
+        if token.contains('@') && token.contains('.')
+            || token
+                .chars()
+                .filter(|character| character.is_ascii_digit())
+                .count()
+                >= 12
+            || ["password", "token=", "secret=", "api_key=", "apikey="]
+                .iter()
+                .any(|needle| token.to_ascii_lowercase().contains(needle))
+        {
+            output.push_str("[redacted]");
+        } else {
+            output.push_str(token);
+        }
+        token.clear();
+    };
+    for character in input.chars().take(max_chars) {
+        if character.is_whitespace() {
+            let lower = token.to_ascii_lowercase();
+            let sensitive_label = ["password", "token", "secret", "api_key", "apikey"]
+                .iter()
+                .any(|needle| lower.contains(needle));
+            let authorization_label = lower.contains("authorization") || lower == "bearer";
+            if redact_remaining > 0 || sensitive_label {
+                output.push_str("[redacted]");
+                redact_remaining = redact_remaining.saturating_sub(1);
+            } else {
+                flush(&mut token, &mut output);
+            }
+            if (sensitive_label || authorization_label)
+                && !lower.contains('=')
+                && !lower.contains(':')
+            {
+                redact_remaining = if authorization_label { 2 } else { 1 };
+            } else if authorization_label && lower.ends_with(':') {
+                redact_remaining = 2;
+            } else if sensitive_label && lower.ends_with(':') {
+                redact_remaining = 1;
+            }
+            token.clear();
+            output.push(character);
+        } else {
+            token.push(character);
+        }
+    }
+    if redact_remaining > 0 {
+        output.push_str("[redacted]");
+    } else {
+        flush(&mut token, &mut output);
+    }
+    output
+}
+
+fn json_accessibility_context(nodes: &[AccessibilityNode]) -> serde_json::Value {
+    serde_json::Value::Array(
+        nodes
+            .iter()
+            .filter(|node| node.states.iter().any(|state| state == "enabled"))
+            .take(JEV_MAX_CANDIDATES)
+            .map(|node| {
+                serde_json::json!({
+                    "index": node.index,
+                    "role": node.role,
+                    "name": redact_caller_text(node.name.as_deref().unwrap_or(""), 80),
+                    "states": node.states.iter().filter(|state| matches!(state.as_str(), "enabled" | "focused" | "focusable" | "editable" | "selected" | "checked")).collect::<Vec<_>>(),
+                    "actions": node.actions.iter().filter(|action| matches!(action.name.to_ascii_lowercase().as_str(), "click" | "activate" | "press" | "toggle" | "select" | "focus")).map(|action| redact_caller_text(&action.name, 40)).collect::<Vec<_>>(),
+                })
+            })
+            .collect(),
+    )
 }
 
 impl ComputerUseLinux {
@@ -6253,6 +6856,177 @@ mod tests {
     /// The run_shell tests change the same process-wide variable, so they
     /// take turns instead of racing each other under the parallel test runner.
     static SHELL_ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static JEV_ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn jev_tool_is_opt_in_and_configuration_failure_is_isolated() {
+        let _lock = JEV_ENV_TEST_LOCK.lock().await;
+        let _flag = EnvVarGuard::unset(jev::ENABLE_ENV);
+        let _key = EnvVarGuard::unset(jev::KEY_ENV);
+        let server = ComputerUseLinux::default();
+        let ordinary = server.router_with_completion(false);
+        assert!(!ordinary.map.contains_key("run_jev_task"));
+        assert!(ordinary.map.contains_key("click"));
+        assert!(ordinary.map.contains_key("doctor"));
+        let _flag = EnvVarGuard::set(jev::ENABLE_ENV, "1");
+        let missing_key = server.router_with_completion(false);
+        assert!(!missing_key.map.contains_key("run_jev_task"));
+        assert!(missing_key.map.contains_key("click"));
+        let _key = EnvVarGuard::set(jev::KEY_ENV, "test-key");
+        assert!(server
+            .router_with_completion(false)
+            .map
+            .contains_key("run_jev_task"));
+    }
+
+    #[test]
+    fn jev_task_rejects_missing_postcondition_and_unsupported_actions_before_dispatch() {
+        let params = JevTaskParams {
+            task: "Open the panel".into(),
+            app_name: "Example".into(),
+            action_allowlist: vec!["run_shell".into()],
+            postcondition: JevPostcondition {
+                kind: "unknown".into(),
+                role: "button".into(),
+                name: "Done".into(),
+                value: None,
+            },
+            window_id: None,
+            literal_text: None,
+            max_steps: 2,
+        };
+        assert!(validate_jev_params(&params).is_some());
+    }
+
+    #[test]
+    fn jev_candidate_ids_are_fresh_and_candidates_follow_the_allowlist() {
+        let node = AccessibilityNode {
+            index: 4,
+            parent_index: None,
+            depth: 1,
+            object_ref: "private-object-ref".into(),
+            role: "push button".into(),
+            name: Some("Open".into()),
+            description: None,
+            child_count: 0,
+            bounds: Some(Bounds {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 20,
+            }),
+            states: vec!["enabled".into()],
+            actions: vec![AccessibilityAction {
+                index: 0,
+                name: "click".into(),
+                description: String::new(),
+                keybinding: String::new(),
+            }],
+            value: None,
+            text: None,
+            supports_editable_text: false,
+        };
+        let first =
+            build_jev_candidates(std::slice::from_ref(&node), &["click".into()], false, None);
+        let second = build_jev_candidates(
+            std::slice::from_ref(&node),
+            &["perform_action".into()],
+            false,
+            None,
+        );
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].operation as u8, JevOperation::Click as u8);
+        assert!(second
+            .iter()
+            .all(|candidate| matches!(candidate.operation, JevOperation::PerformAction)));
+        assert_ne!(first[0].id, second[0].id);
+        assert!(!json_accessibility_context(std::slice::from_ref(&node))
+            .to_string()
+            .contains("private-object-ref"));
+    }
+
+    #[test]
+    fn jev_candidates_accept_sensitive_gtk_widgets_but_reject_inactive_nodes() {
+        let mut node = AccessibilityNode {
+            index: 8,
+            parent_index: None,
+            depth: 1,
+            object_ref: "object".into(),
+            role: "button".into(),
+            name: Some("New Tab".into()),
+            description: None,
+            child_count: 0,
+            bounds: None,
+            states: vec!["sensitive".into()],
+            actions: vec![AccessibilityAction {
+                index: 0,
+                name: "Click".into(),
+                description: String::new(),
+                keybinding: String::new(),
+            }],
+            value: None,
+            text: None,
+            supports_editable_text: false,
+        };
+        let candidates =
+            build_jev_candidates(std::slice::from_ref(&node), &["click".into()], false, None);
+        assert_eq!(candidates.len(), 1);
+
+        node.states = vec!["focusable".into()];
+        assert!(
+            build_jev_candidates(std::slice::from_ref(&node), &["click".into()], false, None)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn jev_postconditions_are_checked_deterministically_against_fresh_nodes() {
+        let node = AccessibilityNode {
+            index: 2,
+            parent_index: None,
+            depth: 1,
+            object_ref: "object".into(),
+            role: "push button".into(),
+            name: Some("Continue".into()),
+            description: None,
+            child_count: 0,
+            bounds: None,
+            states: vec!["enabled".into()],
+            actions: vec![],
+            value: None,
+            text: None,
+            supports_editable_text: false,
+        };
+        let condition = JevPostcondition {
+            kind: "element_enabled".into(),
+            role: "push button".into(),
+            name: "Continue".into(),
+            value: None,
+        };
+        assert!(evaluate_jev_postcondition(
+            &condition,
+            std::slice::from_ref(&node)
+        ));
+        let unsupported = JevPostcondition {
+            kind: "jev_says_done".into(),
+            ..condition
+        };
+        assert!(!evaluate_jev_postcondition(&unsupported, &[node]));
+    }
+
+    #[test]
+    fn jev_redaction_masks_email_credentials_and_bounds_task_text() {
+        let output = redact_caller_text(
+            "use alice@example.test with api_key=topsecret password hunter2",
+            100,
+        );
+        assert!(!output.contains("alice@example.test"));
+        assert!(!output.contains("topsecret"));
+        assert!(!output.contains("hunter2"));
+        assert!(!redact_caller_text("password: hunter2", 100).contains("hunter2"));
+        assert!(!redact_caller_text("Authorization: Bearer ts_secret", 100).contains("ts_secret"));
+        assert_eq!(redact_caller_text("abcdef", 3), "abc");
+    }
 
     /// Exercise the real handlers in a separate process so backend overrides
     /// cannot race other tests. All command programs are harmless stubs; the
